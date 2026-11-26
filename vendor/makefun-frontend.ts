@@ -1496,6 +1496,8 @@ export function sourceUrls(sources: readonly AppSource[]): SourceUrl[] {
   return [...found.keys()].sort(byCodeUnit).map((url) => ({ url, files: found.get(url)! }));
 }
 
+// ---------------------------------------------------------------- canonical JSON
+
 /**
  * JSON with every object's keys in code-unit order and no whitespace: one spelling per value. Takes null, booleans,
  * finite numbers, strings, arrays and plain objects; throws TypeError on anything else (undefined, a function, a
