@@ -1343,3 +1343,451 @@ export function firstLoadOf(tree: AppTree, facts: HtmlFacts, textOf: (path: stri
   const base = pageBaseFrom(facts, INDEX_HTML);
   const paths: string[] = [];
   const missing: LoadMiss[] = [];
+  const seen = new Set<string>();
+  const add = (path: string): boolean => {
+    if (seen.has(path)) return false;
+    seen.add(path);
+    paths.push(path);
+    return true;
+  };
+  /** A reference resolved to a file of app/, or recorded as missing. */
+  const fileOf = (target: string | null, ref: string, where: string): string | null => {
+    if (target !== null && files.has(target)) return target;
+    missing.push({ ref, where });
+    return null;
+  };
+  const walkModule = (path: string): void => {
+    if (!add(path) || !MODULE_NAME.test(path)) return;
+    for (const specifier of sourceImports(textOf(path))) {
+      const target = fileOf(resolveModule(specifier, path, map, base), specifier, `imported by app/${path}`);
+      if (target !== null) walkModule(target);
+    }
+  };
+  /** A font a first-load stylesheet's @font-face names (from `from`, a stylesheet's path or the page's base), added; a data: URL is no file. */
+  const font = (ref: string, from: string, where: string): void => {
+    if (cleanRef(ref) === '' || refOrigin(ref) === 'data:') return;
+    const target = fileOf(resolveAppPath(ref, from), ref, where);
+    if (target !== null) add(target);
+  };
+  const walkCss = (path: string): void => {
+    if (!add(path) || !CSS_NAME.test(path)) return;
+    for (const r of cssReferences(textOf(path))) {
+      if (r.kind === 'font') font(r.ref, path, `@font-face in app/${path}`);
+      if (r.kind !== 'import') continue;
+      const target = fileOf(resolveAppPath(r.ref, path), r.ref, `@import in app/${path}`);
+      if (target !== null) walkCss(target);
+    }
+  };
+  add(INDEX_HTML);
+  for (const link of facts.links) {
+    const rels = relTokens(link.rel);
+    if (isLoadedStylesheet(link.rel)) {
+      const target = fileOf(resolveAppPath(link.href, base), link.href, "index.html's <link rel=stylesheet>");
+      if (target !== null) walkCss(target);
+    } else if (rels.includes('modulepreload')) {
+      const target = fileOf(resolveAppPath(link.href, base), link.href, "index.html's <link rel=modulepreload>");
+      if (target !== null) walkModule(target);
+    } else if (rels.includes('preload')) {
+      const target = fileOf(resolveAppPath(link.href, base), link.href, "index.html's <link rel=preload>");
+      if (target !== null) add(target);
+    }
+  }
+  facts.styles.forEach((style, k) => {
+    for (const r of cssReferences(style)) {
+      if (r.kind === 'font') font(r.ref, base, `@font-face in index.html's <style> ${k + 1}`);
+      if (r.kind !== 'import') continue;
+      const target = fileOf(resolveAppPath(r.ref, base), r.ref, `@import in index.html's <style> ${k + 1}`);
+      if (target !== null) walkCss(target);
+    }
+  });
+  facts.scripts.forEach((script, k) => {
+    if (!isJavaScriptType(script.type)) return;
+    if (script.src !== null) {
+      const target = fileOf(resolveAppPath(script.src, base), script.src, "index.html's <script src>");
+      if (target === null) return;
+      if (script.type === 'module') walkModule(target);
+      else add(target);
+    } else if (script.type === 'module') {
+      for (const specifier of sourceImports(script.text)) {
+        const target = fileOf(resolveModule(specifier, INDEX_HTML, map, base), specifier, `imported by index.html's inline module script ${k + 1}`);
+        if (target !== null) walkModule(target);
+      }
+    }
+  });
+
+  // Later: what the import() calls reach, from every first-load script and module, then each inline script.
+  const later: string[] = [];
+  const laterMissing: LoadMiss[] = [];
+  const computed: string[] = [];
+  const laterFile = (target: string | null, ref: string, where: string): string | null => {
+    if (target !== null && files.has(target)) return target;
+    laterMissing.push({ ref, where });
+    return null;
+  };
+  const dynamicFrom = (code: string, from: string, where: string): void => {
+    for (const specifier of dynamicImports(code)) {
+      if (specifier === null) {
+        computed.push(where);
+        continue;
+      }
+      const target = laterFile(resolveModule(specifier, from, map, base), specifier, `import() in ${where}`);
+      if (target !== null) walkLater(target);
+    }
+  };
+  const walkLater = (path: string): void => {
+    if (seen.has(path)) return;
+    seen.add(path);
+    later.push(path);
+    if (!MODULE_NAME.test(path)) return;
+    const code = textOf(path);
+    for (const specifier of sourceImports(code)) {
+      const target = laterFile(resolveModule(specifier, path, map, base), specifier, `imported by app/${path}`);
+      if (target !== null) walkLater(target);
+    }
+    dynamicFrom(code, path, `app/${path}`);
+  };
+  for (const path of [...paths]) if (MODULE_NAME.test(path)) dynamicFrom(textOf(path), path, `app/${path}`);
+  facts.scripts.forEach((script, k) => {
+    if (script.src === null && isJavaScriptType(script.type)) dynamicFrom(script.text, INDEX_HTML, `index.html's inline script ${k + 1}`);
+  });
+  return { paths, missing, later, laterMissing, computed };
+}
+
+/** An absolute http(s) or ws(s) URL in source text: up to a space, quote, bracket, brace, backslash, $, comma or semicolon. */
+const URL_IN_TEXT = /\b(?:https?|wss?):\/\/[^\s"'`<>()[\]{}\\^|$,;]+/gi;
+
+/** One distinct URL the source names, with the source files naming it in path order. */
+export interface SourceUrl {
+  url: string;
+  files: string[];
+}
+
+/**
+ * Every distinct absolute http://, https://, ws:// or wss:// URL the source files name, in code-unit order, each with
+ * the files naming it (in the order `sources` gives them). A URL runs to a space, quote, bracket, brace, backslash, $,
+ * comma or semicolon, its trailing . : ! ? dropped.
+ */
+export function sourceUrls(sources: readonly AppSource[]): SourceUrl[] {
+  const found = new Map<string, string[]>();
+  for (const s of sources) {
+    for (const m of text(s.bytes).matchAll(URL_IN_TEXT)) {
+      const url = m[0].replace(/[.:!?]+$/, '');
+      if (!/^[A-Za-z]+:\/\/[^/]/.test(url)) continue;
+      const at = found.get(url);
+      if (at === undefined) found.set(url, [s.path]);
+      else if (at[at.length - 1] !== s.path) at.push(s.path);
+    }
+  }
+  return [...found.keys()].sort(byCodeUnit).map((url) => ({ url, files: found.get(url)! }));
+}
+
+// ---------------------------------------------------------------- canonical JSON
+
+/**
+ * JSON with every object's keys in code-unit order and no whitespace: one spelling per value. Takes null, booleans,
+ * finite numbers, strings, arrays and plain objects; throws TypeError on anything else (undefined, a function, a
+ * bigint, NaN, Infinity, a class instance).
+ */
+export function canonicalJson(value: unknown): string {
+  if (value === null || typeof value === 'boolean' || typeof value === 'string') return JSON.stringify(value);
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new TypeError(`canonicalJson: ${value} is not a finite number`);
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map((v) => canonicalJson(v)).join(',')}]`;
+  if (typeof value === 'object') {
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) throw new TypeError('canonicalJson: only plain objects and arrays');
+    const o = value as Record<string, unknown>;
+    return `{${Object.keys(o)
+      .sort(byCodeUnit)
+      .map((k) => `${JSON.stringify(k)}:${canonicalJson(o[k])}`)
+      .join(',')}}`;
+  }
+  throw new TypeError(`canonicalJson: a ${typeof value} has no JSON form`);
+}
+
+// ---------------------------------------------------------------- the dossier
+
+const PNG_MAGIC = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+const JPEG_MAGIC = [0xff, 0xd8, 0xff];
+/** contracts/dossier.ts DossierImageName. */
+const IMAGE_NAME = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/;
+
+const opensWith = (bytes: Uint8Array, magic: readonly number[], at = 0): boolean => bytes.length >= at + magic.length && magic.every((b, i) => bytes[at + i] === b);
+
+/** A file's extension, lowercased, for the Load block's asset counts ('(none)' when it has none). */
+const extensionOf = (path: string): string => {
+  const base = path.split('/').pop() ?? '';
+  const dot = base.lastIndexOf('.');
+  return dot > 0 ? base.slice(dot + 1).toLowerCase() : '(none)';
+};
+
+/** One first-load file with its raw and gzip-9 sizes. */
+export interface LoadFile {
+  path: string;
+  raw: number;
+  gzip: number;
+}
+
+/** A URL as the Load block shows it: at most URL_SHOWN_CHARS characters, a longer one cut with an ellipsis. */
+function shownUrl(url: string): string {
+  const chars = [...url];
+  return chars.length <= URL_SHOWN_CHARS ? url : `${chars.slice(0, URL_SHOWN_CHARS - 1).join('')}…`;
+}
+
+/** A load's lines: its heading with the totals, a line a file (FIRST_LOAD_LISTED listed, the rest summed), then its references naming no file of app/. */
+function loadLines(heading: string, load: readonly LoadFile[], missing: readonly LoadMiss[], what: string): string[] {
+  const raw = load.reduce((n, f) => n + f.raw, 0);
+  const gzip = load.reduce((n, f) => n + f.gzip, 0);
+  const lines = [`${heading}: ${load.length} file${load.length === 1 ? '' : 's'}, ${raw} bytes raw, ${gzip} bytes gzip-${GZIP_LEVEL}`];
+  for (const f of load.slice(0, FIRST_LOAD_LISTED)) lines.push(`  app/${f.path}: ${f.raw} bytes raw, ${f.gzip} bytes gzip-${GZIP_LEVEL}`);
+  if (load.length > FIRST_LOAD_LISTED) {
+    const rest = load.slice(FIRST_LOAD_LISTED);
+    lines.push(`  and ${rest.length} more file${rest.length === 1 ? '' : 's'}: ${rest.reduce((n, f) => n + f.raw, 0)} bytes raw, ${rest.reduce((n, f) => n + f.gzip, 0)} bytes gzip-${GZIP_LEVEL}`);
+  }
+  for (const m of missing.slice(0, MISSING_LISTED)) lines.push(`  not in app/: ${shownUrl(m.ref)} (${m.where})`);
+  if (missing.length > MISSING_LISTED) lines.push(`  and ${missing.length - MISSING_LISTED} more ${what} reference${missing.length - MISSING_LISTED === 1 ? '' : 's'} not in app/`);
+  return lines;
+}
+
+/** A load's totals as the `Totals:` line says them: `N files, G bytes gzip-9`, then ` (R raw)` when `raw`. */
+function loadTotals(load: readonly LoadFile[], raw: boolean): string {
+  const gzip = load.reduce((n, f) => n + f.gzip, 0);
+  const rawText = raw ? ` (${load.reduce((n, f) => n + f.raw, 0)} raw)` : '';
+  return `${load.length} file${load.length === 1 ? '' : 's'}, ${gzip} bytes gzip-${GZIP_LEVEL}${rawText}`;
+}
+
+/**
+ * The `## Load` block's lines: the `Totals:` line (the first load's, what import() loads later and the whole app's, on
+ * one line), the first load's files and totals, what import() loads later, the whole app by class, and the URLs in the
+ * source.
+ */
+function loadBlockLines(tree: AppTree, load: LoadFile[], missing: readonly LoadMiss[], later: LoadFile[], laterMissing: readonly LoadMiss[], computed: readonly string[], urls: readonly SourceUrl[]): string[] {
+  const source = tree.files.filter((f) => f.cls === 'source');
+  const vendored = tree.files.filter((f) => f.cls === 'vendored');
+  const assets = tree.files.filter((f) => f.cls === 'asset');
+  const sum = (list: readonly AppFile[]): number => list.reduce((n, f) => n + f.bytes, 0);
+  const totals = `Totals: first load ${loadTotals(load, true)}; later by import() ${loadTotals(later, false)}; whole app ${tree.files.length} file${tree.files.length === 1 ? '' : 's'}, ${tree.totalBytes} bytes`;
+  const lines = ['## Load', '', totals, ...loadLines('First load', load, missing, 'first-load'), ...loadLines('Loaded later by import()', later, laterMissing, 'import()')];
+  if (computed.length > 0) {
+    lines.push(`  and ${computed.length} import() call${computed.length === 1 ? '' : 's'} of a computed specifier, not followed (the first in ${computed[0]!.startsWith('app/') ? '' : 'app/'}${computed[0]})`);
+  }
+  lines.push(`Whole app: ${tree.files.length} file${tree.files.length === 1 ? '' : 's'}, ${tree.totalBytes} bytes; ${tree.directories.length} director${tree.directories.length === 1 ? 'y' : 'ies'}`);
+  lines.push(`Source files: ${source.length} (${sum(source)} bytes)`);
+  lines.push(`Vendored files: ${vendored.length} (${sum(vendored)} bytes)`);
+  if (vendored.length > 0) {
+    const listed = vendored.slice(0, VENDORED_LISTED).map((f) => `app/${f.path} (${f.bytes} bytes)`);
+    const more = vendored.length > VENDORED_LISTED ? `, and ${vendored.length - VENDORED_LISTED} more` : '';
+    lines.push(`  ${listed.join(', ')}${more}`);
+  }
+  const byExt = new Map<string, { n: number; bytes: number }>();
+  for (const f of assets) {
+    const ext = extensionOf(f.path);
+    const at = byExt.get(ext) ?? { n: 0, bytes: 0 };
+    at.n++;
+    at.bytes += f.bytes;
+    byExt.set(ext, at);
+  }
+  const extText = [...byExt]
+    .sort((a, b) => byCodeUnit(a[0], b[0]))
+    .map(([ext, at]) => `${ext} ${at.n} (${at.bytes} bytes)`)
+    .join(', ');
+  lines.push(`Assets: ${extText === '' ? 'none' : extText}`);
+  lines.push(`URLs in the source: ${urls.length}`);
+  for (const u of urls.slice(0, URLS_LISTED)) {
+    const more = u.files.length > 1 ? ` and ${u.files.length - 1} more file${u.files.length === 2 ? '' : 's'}` : '';
+    lines.push(`  ${shownUrl(u.url)} (app/${u.files[0]}${more})`);
+  }
+  if (urls.length > URLS_LISTED) lines.push(`  and ${urls.length - URLS_LISTED} more`);
+  return lines;
+}
+
+/** A distinct source as the dossier shows it. */
+interface SourceCode {
+  norm: Uint8Array;
+  text: string;
+  fence: string;
+  /** The fenced block: the fence and its language, the text (a last LF added when it lacks one), the fence, a blank line. */
+  block: string;
+  blockBytes: number;
+  lines: number;
+}
+
+/**
+ * A source's section cut inside its text: its heading, its first k lines in its fence (closed), a line naming how
+ * many of its lines are not shown, then `tail(hidden)` (the cut line, given the source bytes this file leaves out),
+ * k the most lines (at least one, fewer than all) whose whole fits in `room` UTF-8 bytes; null when not one line
+ * fits. It cuts only after a line's LF, which is never inside a UTF-8 sequence nor a replacement character's bytes,
+ * so no character is split, and a line's shown bytes are those of its text.
+ */
+function sourceHead(heading: string, code: { norm: Uint8Array; text: string; fence: string }, language: string, room: number, tail: (hidden: number) => string): string | null {
+  const total = lineCount(code.norm);
+  const lines = code.text.split('\n');
+  const open = `${code.fence}${language}\n`;
+  const close = `${code.fence}\n\n`;
+  const note = (k: number): string => `[${total - k} of this file's ${total} lines not shown.]\n`;
+  const fixed = byteLength(heading) + byteLength(open) + byteLength(close);
+  let best = 0;
+  let shown = 0;
+  let raw = 0;
+  for (let k = 1; k < total; k++) {
+    shown += byteLength(lines[k - 1]!) + 1;
+    raw = code.norm.indexOf(0x0a, raw) + 1;
+    if (fixed + shown + byteLength(note(k)) + byteLength(tail(code.norm.length - raw)) <= room) best = k;
+  }
+  if (best === 0) return null;
+  let rawEnd = 0;
+  for (let k = 0; k < best; k++) rawEnd = code.norm.indexOf(0x0a, rawEnd) + 1;
+  const head = lines.slice(0, best).map((l) => `${l}\n`).join('');
+  return `${heading}${open}${head}${close}${note(best)}${tail(code.norm.length - rawEnd)}`;
+}
+
+/**
+ * The dossier (makefun/dossier/v1, contracts/dossier.ts) of an entry directory, as canonical JSON bytes: `dir/app/`'s
+ * files and `dir/screenshots/`'s PNG and JPEG files (names starting with '.' skipped). `images` are the screenshots in
+ * name order, the first the cover; `text` is the "## Load" block then "## Sources", as this file's header says. Throws
+ * DossierError on an app tree it cannot read or one past a cap (readAppTree), a missing app/index.html, screenshots no
+ * dossier can hold, a text cap that cannot hold the Load block and the cut line, or a dossier past DOSSIER_MAX_BYTES.
+ */
+export function buildDossier(dir: string, caps: DossierCaps): Uint8Array {
+  const max = caps.text_max_bytes;
+  if (!Number.isSafeInteger(max) || max <= 0) throw new DossierError(`buildDossier: caps.text_max_bytes must be a positive integer, not ${String(max)}`, 'text_max_bytes');
+  // The binding screenshot caps, each with whose it is: the caller's when given and tighter, else the dossier's.
+  let maxImages = { n: DOSSIER_MAX_IMAGES, whose: 'a dossier holds' };
+  let maxImageBytes = { n: DOSSIER_MAX_BYTES, whose: 'a dossier holds' };
+  if (caps.screenshots !== undefined) {
+    const s = caps.screenshots as { max?: unknown; max_bytes?: unknown } | null;
+    if (typeof s !== 'object' || s === null) throw new DossierError('buildDossier: caps.screenshots must be an object {max, max_bytes}');
+    for (const k of ['max', 'max_bytes'] as const) {
+      const v = s[k];
+      if (typeof v !== 'number' || !Number.isSafeInteger(v) || v <= 0) throw new DossierError(`buildDossier: caps.screenshots.${k} must be a positive integer, not ${String(v)}`, `screenshots.${k}`);
+    }
+    if ((s.max as number) < maxImages.n) maxImages = { n: s.max as number, whose: 'caps.screenshots.max allows' };
+    if ((s.max_bytes as number) < maxImageBytes.n) maxImageBytes = { n: s.max_bytes as number, whose: 'caps.screenshots.max_bytes allows' };
+  }
+  const appCaps: AppCaps = {};
+  for (const k of ['app_max_files', 'app_max_bytes', 'app_path_max_bytes'] as const) {
+    const v = caps[k] as unknown;
+    if (v === undefined) continue;
+    if (typeof v !== 'number' || !Number.isSafeInteger(v) || v < 0) throw new DossierError(`buildDossier: caps.${k} must be a whole number, not ${String(v)}`, k);
+    appCaps[k] = v;
+  }
+
+  const appDir = join(dir, 'app');
+  const tree = readAppTree(appDir, appCaps);
+  const htmlBytes = readIndexHtml(appDir, tree);
+  const html = htmlFacts(text(htmlBytes));
+
+  // Every file the walks read is read once, here, and kept by path.
+  const fileBytes = new Map<string, Uint8Array>([[INDEX_HTML, htmlBytes]]);
+  const bytesOf = (path: string): Uint8Array => {
+    let b = fileBytes.get(path);
+    if (b === undefined) {
+      try {
+        b = new Uint8Array(readFileSync(join(appDir, path)));
+      } catch (err) {
+        throw new DossierError(`buildDossier: app/${path}: cannot be read (${(err as Error).message})`);
+      }
+      fileBytes.set(path, b);
+    }
+    return b;
+  };
+  const sources: AppSource[] = tree.files.filter((f) => f.cls === 'source').map((f) => ({ path: f.path, bytes: bytesOf(f.path) }));
+  const byPath = new Map(sources.map((s) => [s.path, s]));
+
+  const firstLoad = firstLoadOf(tree, html, (path) => text(bytesOf(path)));
+  const sized = (path: string): LoadFile => {
+    const b = bytesOf(path);
+    return { path, raw: b.length, gzip: gzipBytes(b) };
+  };
+  const load = firstLoad.paths.map(sized);
+  const later = firstLoad.later.map(sized);
+  const urls = sourceUrls(sources);
+
+  const modules = importOrder(sources, html).filter((p) => p !== INDEX_HTML);
+  const styles = cssOrder(sources, html).filter((p) => !modules.includes(p));
+  const seen = new Set<string>([INDEX_HTML, ...modules, ...styles]);
+  const rest = sources.map((s) => s.path).filter((p) => !seen.has(p)).sort(byCodeUnit);
+  const order = [INDEX_HTML, ...modules, ...styles, ...rest];
+
+  const codeOf = (path: string): SourceCode | null => {
+    const file = byPath.get(path);
+    if (file === undefined) return null;
+    const t = text(file.bytes);
+    const fence = fenceFor(t);
+    const block = `${fence}${languageOf(path)}\n${t}${t.endsWith('\n') ? '' : '\n'}${fence}\n\n`;
+    return { norm: file.bytes, text: t, fence, block, blockBytes: byteLength(block), lines: lineCount(file.bytes) };
+  };
+
+  const shotNames = (() => {
+    const shotsDir = join(dir, 'screenshots');
+    let shotDirStat;
+    try {
+      shotDirStat = lstatSync(shotsDir);
+    } catch {
+      throw new DossierError('buildDossier: no screenshots/ directory: an entry hands in 3 screenshots of its running app, the first by name the cover');
+    }
+    if (!shotDirStat.isDirectory()) throw new DossierError('buildDossier: screenshots is not a directory: an entry hands in 3 screenshots of its running app, the first by name the cover');
+    try {
+      return readdirSync(shotsDir, { withFileTypes: true })
+        .filter((e) => e.isFile() && !e.name.startsWith('.'))
+        .map((e) => e.name)
+        .sort(byCodeUnit);
+    } catch (err) {
+      throw new DossierError(`buildDossier: screenshots/ cannot be read (${(err as Error).message})`);
+    }
+  })();
+  if (shotNames.length === 0) throw new DossierError('buildDossier: screenshots/ holds no image: the first is the cover');
+  if (shotNames.length > maxImages.n) throw new DossierError(`buildDossier: screenshots/ holds ${shotNames.length} files, over the ${maxImages.n} ${maxImages.whose}`, 'screenshots.max');
+  const images = shotNames.map((name) => {
+    if (!IMAGE_NAME.test(name)) throw new DossierError(`buildDossier: screenshots/${name}: a name is letters, digits and . _ -, 1 to 128 characters, not starting with . or -`);
+    const size = lstatSync(join(dir, 'screenshots', name)).size;
+    if (size > maxImageBytes.n) throw new DossierError(`buildDossier: screenshots/${name} is ${size} bytes, over the ${maxImageBytes.n} ${maxImageBytes.whose}`, 'screenshots.max_bytes');
+    const bytes = new Uint8Array(readFileSync(join(dir, 'screenshots', name)));
+    if (bytes.length > maxImageBytes.n) throw new DossierError(`buildDossier: screenshots/${name} is ${bytes.length} bytes, over the ${maxImageBytes.n} ${maxImageBytes.whose}`, 'screenshots.max_bytes');
+    const media_type = opensWith(bytes, PNG_MAGIC) ? 'image/png' : opensWith(bytes, JPEG_MAGIC) ? 'image/jpeg' : null;
+    if (media_type === null) throw new DossierError(`buildDossier: screenshots/${name} is neither a PNG nor a JPEG`);
+    return { name, media_type, sha256: sha256Hex(bytes), base64: Buffer.from(bytes).toString('base64') };
+  });
+
+  const head = [...loadBlockLines(tree, load, firstLoad.missing, later, firstLoad.laterMissing, firstLoad.computed, urls), '', '## Sources', '', ''].join('\n');
+  const sections = order.map((path) => {
+    const code = codeOf(path);
+    const lines = code === null ? 0 : code.lines;
+    const bytes = code === null ? 0 : code.norm.length;
+    const heading = `### app/${path} (${bytes} bytes)\n\n`;
+    const shown = lines === 0 ? null : code;
+    return { heading, code: shown, size: byteLength(heading) + (shown === null ? 0 : shown.blockBytes), bytes };
+  });
+  // restBytes[k]: the source bytes of the files after section k.
+  const restBytes = new Array<number>(sections.length + 1).fill(0);
+  for (let k = sections.length - 1; k >= 0; k--) restBytes[k] = restBytes[k + 1]! + (k + 1 < sections.length ? sections[k + 1]!.bytes : 0);
+
+  const cutLine = (files: number, bytes: number): string => `[Cut at ${max} bytes: ${files} file${files === 1 ? '' : 's'} and ${bytes} bytes of source left out.]\n`;
+  let out = head;
+  let used = byteLength(head);
+  let kept = 0;
+  for (; kept < sections.length; kept++) {
+    const section = sections[kept]!;
+    const restCount = sections.length - kept - 1;
+    const tail = restCount === 0 ? 0 : byteLength(cutLine(restCount, restBytes[kept]!));
+    if (used + section.size + tail > max) break;
+    out += section.code === null ? section.heading : `${section.heading}${section.code.block}`;
+    used += section.size;
+  }
+  if (kept < sections.length) {
+    // The first source that does not fit whole: its head, up to its last complete line that fits, then nothing more.
+    const first = sections[kept]!;
+    const restCount = sections.length - kept - 1;
+    const after = restBytes[kept]!;
+    const part = first.code === null ? null : sourceHead(first.heading, first.code, languageOf(order[kept]!), max - used, (hidden) => cutLine(restCount, after + hidden));
+    out += part ?? cutLine(restCount + 1, after + first.bytes);
+  }
+  if (byteLength(out) > max) throw new DossierError(`buildDossier: caps.text_max_bytes ${max} cannot hold even the Load block and the cut line`, 'text_max_bytes');
+
+  const doc = { schema: DOSSIER_SCHEMA, cover: 0, text: out.replace(/\n+$/, '\n'), images };
+  const bytes = Buffer.from(canonicalJson(doc), 'utf8');
+  if (bytes.length > DOSSIER_MAX_BYTES) throw new DossierError(`buildDossier: the dossier is ${bytes.length} bytes, over the ${DOSSIER_MAX_BYTES} one holds`);
+  return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.length);
+}
