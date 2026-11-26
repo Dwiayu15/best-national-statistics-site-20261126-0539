@@ -448,3 +448,453 @@ function tagEnd(html: string, from: number): number {
   const space = (k: number): boolean => k < n && HTML_SPACE.test(html[k]!);
   let i = from;
   while (i < n && !HTML_SPACE.test(html[i]!) && html[i] !== '/' && html[i] !== '>') i++;
+  for (;;) {
+    while (i < n && (HTML_SPACE.test(html[i]!) || html[i] === '/')) i++;
+    if (i >= n) return -1;
+    if (html[i] === '>') return i;
+    // An attribute's name: its first character may be anything (an `=` or a quote among them), then up to a space, / > or =.
+    i++;
+    while (i < n && !HTML_SPACE.test(html[i]!) && html[i] !== '/' && html[i] !== '>' && html[i] !== '=') i++;
+    while (space(i)) i++;
+    if (i >= n) return -1;
+    if (html[i] !== '=') continue;
+    i++;
+    while (space(i)) i++;
+    if (i >= n) return -1;
+    const quote = html[i]!;
+    if (quote === '"' || quote === "'") {
+      const close = html.indexOf(quote, i + 1);
+      if (close < 0) return -1;
+      i = close + 1;
+      continue;
+    }
+    if (quote === '>') return i;
+    while (i < n && !HTML_SPACE.test(html[i]!) && html[i] !== '>') i++;
+  }
+}
+
+/**
+ * Where a comment opening at `at` (`<!--`) ends, just past it, as a browser ends it: `<!-->` and `<!--->` are whole
+ * comments, any other runs to its first `-->` or `--!>`, and one never closed runs to the end of the page.
+ */
+function commentEnd(html: string, at: number): number {
+  const body = at + 4;
+  if (html[body] === '>') return body + 1;
+  if (html.startsWith('->', body)) return body + 2;
+  const plain = html.indexOf('-->', body);
+  const bang = html.indexOf('--!>', body);
+  if (plain < 0 && bang < 0) return html.length;
+  if (bang < 0 || (plain >= 0 && plain < bang)) return plain + 3;
+  return bang + 4;
+}
+
+/** A tag body's attributes, names lowercased, values unquoted; a present attribute with no value is ''. The first of a name wins. */
+function attributesOf(body: string): Map<string, string> {
+  const out = new Map<string, string>();
+  let i = 0;
+  while (i < body.length) {
+    while (i < body.length && /[\s/]/.test(body[i]!)) i++;
+    if (i >= body.length) break;
+    const start = i;
+    while (i < body.length && !/[\s=/>]/.test(body[i]!)) i++;
+    const name = body.slice(start, i).toLowerCase();
+    while (i < body.length && /\s/.test(body[i]!)) i++;
+    let value = '';
+    if (body[i] === '=') {
+      i++;
+      while (i < body.length && /\s/.test(body[i]!)) i++;
+      const quote = body[i];
+      if (quote === '"' || quote === "'") {
+        const end = body.indexOf(quote, i + 1);
+        value = body.slice(i + 1, end < 0 ? body.length : end);
+        i = end < 0 ? body.length : end + 1;
+      } else {
+        // An unquoted value runs to whitespace or the tag's >; a / inside it is part of the value.
+        const s = i;
+        while (i < body.length && !/[\s>]/.test(body[i]!)) i++;
+        value = body.slice(s, i);
+      }
+    }
+    if (name !== '' && !out.has(name)) out.set(name, decodeEntities(value));
+  }
+  return out;
+}
+
+/** The character references an attribute value may carry for a URL's punctuation, decoded (others are left as they are). */
+function decodeEntities(value: string): string {
+  if (!value.includes('&')) return value;
+  const named: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", sol: '/', colon: ':', period: '.', tab: '\t', newline: '\n', bsol: '\\', quest: '?', num: '#', equals: '=', percnt: '%' };
+  return value.replace(/&(?:#(\d{1,7})|#[xX]([0-9A-Fa-f]{1,6})|([A-Za-z]+));?/g, (whole, dec: string | undefined, hex: string | undefined, name: string | undefined) => {
+    const cp = dec !== undefined ? Number.parseInt(dec, 10) : hex !== undefined ? Number.parseInt(hex, 16) : null;
+    if (cp !== null) return cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : whole;
+    const lower = (name ?? '').toLowerCase();
+    return Object.hasOwn(named, lower) && name === lower ? named[lower]! : whole;
+  });
+}
+
+/**
+ * The index of the end tag `</name` closing a raw-text element, at or after `from`, ASCII case-insensitively and
+ * followed by a space, / or > (as a browser closes one: `</scripts>` does not); -1 when there is none.
+ */
+function closeIndexOf(html: string, from: number, name: string): number {
+  const needle = `</${name}`;
+  for (let i = from; i + needle.length <= html.length; i++) {
+    if (html[i] !== '<') continue;
+    let hit = true;
+    for (let j = 1; j < needle.length; j++) {
+      const a = html[i + j]!.toLowerCase();
+      if (a !== needle[j]) {
+        hit = false;
+        break;
+      }
+    }
+    const after = html[i + needle.length];
+    if (hit && after !== undefined && (after === '/' || after === '>' || HTML_SPACE.test(after))) return i;
+  }
+  return -1;
+}
+
+/** Whether the tag at `at` (just past '<') is `name`, followed by no name character. */
+const tagIs = (html: string, at: number, name: string): boolean => html.slice(at, at + name.length).toLowerCase() === name && !/[A-Za-z0-9-]/.test(html[at + name.length] ?? '');
+
+/**
+ * Every <script>, <link href>, <base href>, <style>, <img src>, <source src>, <video src>, <audio src>, <iframe src>
+ * and <script type="importmap"> of a page, in document order. Comments hide the tags inside them, ended where a
+ * browser ends them (`<!-->`, `<!--->`, the first `-->` or `--!>`); `<!...>` (the document type), `<?...>` and a
+ * `</` not followed by a letter are bogus comments that end at their first `>`; a `<` not followed by a letter, `!`,
+ * `/` or `?` is text. A tag ends at its first `>` outside a quoted attribute value, a quote quoting only where a value
+ * starts. This is a tag scan, not an HTML parser: it reads the attributes these tags carry and nothing else.
+ */
+export function htmlFacts(html: string): HtmlFacts {
+  const scripts: HtmlScript[] = [];
+  const links: HtmlLink[] = [];
+  const resources: HtmlResource[] = [];
+  const importMaps: HtmlImportMap[] = [];
+  const bases: string[] = [];
+  const styles: string[] = [];
+  let i = 0;
+  while (i < html.length) {
+    const at = html.indexOf('<', i);
+    if (at < 0) break;
+    if (html.startsWith('<!--', at)) {
+      i = commentEnd(html, at);
+      continue;
+    }
+    const next = html[at + 1] ?? '';
+    if (next === '!' || next === '?' || (next === '/' && !/[A-Za-z]/.test(html[at + 2] ?? ''))) {
+      // A bogus comment (the document type among them): it ends at its first `>`, quotes or not.
+      const end = html.indexOf('>', at + 2);
+      i = end < 0 ? html.length : end + 1;
+      continue;
+    }
+    if (next !== '/' && !/[A-Za-z]/.test(next)) {
+      i = at + 1;
+      continue;
+    }
+    const name = at + 1;
+    if (tagIs(html, name, 'script')) {
+      const end = tagEnd(html, name + 6);
+      if (end < 0) break;
+      const attrs = attributesOf(html.slice(name + 6, end));
+      const type = (attrs.get('type') ?? '').trim().toLowerCase();
+      const src = attrs.get('src') ?? null;
+      const close = closeIndexOf(html, end + 1, 'script');
+      const body = src === null ? html.slice(end + 1, close < 0 ? html.length : close) : '';
+      i = close < 0 ? html.length : close + 8;
+      if (type === 'importmap') {
+        let value: unknown = null;
+        let error: string | null = null;
+        try {
+          value = JSON.parse(body);
+        } catch (err) {
+          error = (err as Error).message;
+        }
+        importMaps.push({ value, error });
+      } else {
+        scripts.push({ src, type, text: body });
+      }
+      continue;
+    }
+    if (tagIs(html, name, 'style')) {
+      const end = tagEnd(html, name + 5);
+      if (end < 0) break;
+      const close = closeIndexOf(html, end + 1, 'style');
+      styles.push(html.slice(end + 1, close < 0 ? html.length : close));
+      i = close < 0 ? html.length : close + 7;
+      continue;
+    }
+    if (tagIs(html, name, 'link')) {
+      const end = tagEnd(html, name + 4);
+      if (end < 0) break;
+      const attrs = attributesOf(html.slice(name + 4, end));
+      const href = attrs.get('href');
+      if (href !== undefined) links.push({ href, rel: (attrs.get('rel') ?? '').trim().toLowerCase(), as: (attrs.get('as') ?? '').trim().toLowerCase() });
+      i = end + 1;
+      continue;
+    }
+    if (tagIs(html, name, 'base')) {
+      const end = tagEnd(html, name + 4);
+      if (end < 0) break;
+      const href = attributesOf(html.slice(name + 4, end)).get('href');
+      if (href !== undefined) bases.push(href);
+      i = end + 1;
+      continue;
+    }
+    const tag = RESOURCE_TAGS.find((t) => tagIs(html, name, t));
+    if (tag !== undefined) {
+      const end = tagEnd(html, name + tag.length);
+      if (end < 0) break;
+      const src = attributesOf(html.slice(name + tag.length, end)).get('src');
+      if (src !== undefined) resources.push({ tag, src });
+      i = end + 1;
+      continue;
+    }
+    const end = tagEnd(html, name);
+    i = end < 0 ? html.length : end + 1;
+  }
+  return { scripts, links, resources, importMaps, bases, styles };
+}
+
+/** Whether a <script type> is one a browser runs as JavaScript (classic or module). */
+export function isJavaScriptType(type: string): boolean {
+  return JS_TYPE.test(type);
+}
+
+/** A <link rel>'s tokens. */
+export const relTokens = (rel: string): string[] => rel.split(/\s+/).filter((t) => t !== '');
+
+/** A page's import map: its imports and scopes, each a specifier to a reference; a null value blocks its specifier. */
+export interface ImportMap {
+  imports: Record<string, string | null>;
+  scopes: Record<string, Record<string, string | null>>;
+}
+
+/** A page's one import map, or why it has none: `map` is null when `error` says why (no map at all is no error). */
+export interface ImportMapRead {
+  map: ImportMap | null;
+  error: string | null;
+}
+
+/** Whether `value` is a plain object. */
+const isObject = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
+
+/** An own enumerable property set whatever its key: a "__proto__" key stays a key, never the prototype. */
+function setOwn<T>(o: Record<string, T>, key: string, value: T): void {
+  Object.defineProperty(o, key, { value, enumerable: true, writable: true, configurable: true });
+}
+
+/**
+ * The page's single import map, parsed, or why there is none. A page with no import map has map null and error null
+ * (an app needs none); two maps, or one that is not a JSON object of string or null values, is an error. A null value
+ * is kept: it blocks its specifier.
+ */
+export function importMapOf(facts: HtmlFacts): ImportMapRead {
+  if (facts.importMaps.length === 0) return { map: null, error: null };
+  if (facts.importMaps.length > 1) return { map: null, error: `the page holds ${facts.importMaps.length} import maps: a page holds one` };
+  const only = facts.importMaps[0]!;
+  if (only.error !== null) return { map: null, error: `the page's import map is not JSON (${only.error})` };
+  if (!isObject(only.value)) return { map: null, error: "the page's import map is not a JSON object" };
+  const imports: Record<string, string | null> = {};
+  const importsRaw = only.value.imports;
+  if (importsRaw !== undefined) {
+    if (!isObject(importsRaw)) return { map: null, error: 'the page\'s import map holds an "imports" that is not an object' };
+    for (const [key, value] of Object.entries(importsRaw)) {
+      if (value !== null && typeof value !== 'string') return { map: null, error: `the page's import map maps ${JSON.stringify(key)} to no string` };
+      setOwn(imports, key, value);
+    }
+  }
+  const scopes: Record<string, Record<string, string | null>> = {};
+  const scopesRaw = only.value.scopes;
+  if (scopesRaw !== undefined) {
+    if (!isObject(scopesRaw)) return { map: null, error: 'the page\'s import map holds a "scopes" that is not an object' };
+    for (const [scope, entries] of Object.entries(scopesRaw)) {
+      if (!isObject(entries)) return { map: null, error: `the page's import map scope ${JSON.stringify(scope)} is not an object` };
+      const inner: Record<string, string | null> = {};
+      for (const [key, value] of Object.entries(entries)) {
+        if (value !== null && typeof value !== 'string') return { map: null, error: `the page's import map scope ${JSON.stringify(scope)} maps ${JSON.stringify(key)} to no string` };
+        setOwn(inner, key, value);
+      }
+      setOwn(scopes, scope, inner);
+    }
+  }
+  return { map: { imports, scopes }, error: null };
+}
+
+// ---------------------------------------------------------------- references
+
+/** A URI scheme's leading `name:`. */
+const URI_SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:/;
+
+/**
+ * A reference as a browser's URL parser reads it: leading and trailing spaces and C0 controls trimmed, every tab, LF
+ * and CR inside dropped, and every backslash read as a slash (as an http(s) URL reads it).
+ */
+export function cleanRef(ref: string): string {
+  // eslint-disable-next-line no-control-regex
+  return ref.replace(/^[\u0000- ]+|[\u0000- ]+$/g, '').replace(/[\t\n\r]/g, '').replace(/\\/g, '/');
+}
+
+/** Whether a reference names a path of the app's own server: not empty, no scheme and no leading //. */
+export function isLocalRef(ref: string): boolean {
+  const r = cleanRef(ref);
+  return r.length > 0 && !URI_SCHEME.test(r) && !r.startsWith('//');
+}
+
+/**
+ * An absolute reference's origin as a browser reads it on an https page: `https://make.fun` for
+ * `https://make.fun/api/x` or `//make.fun/x`; `data:` for a data URL; the scheme (like `javascript:` or `blob:`) for
+ * any other with no host; null for a local reference. A reference no URL parser takes is its scheme, or `invalid`.
+ */
+export function refOrigin(ref: string): string | null {
+  const r = cleanRef(ref);
+  if (r.length === 0 || isLocalRef(r)) return null;
+  let url: URL;
+  try {
+    url = new URL(r, 'https://local.invalid/');
+  } catch {
+    return URI_SCHEME.exec(r)?.[0]?.toLowerCase() ?? 'invalid';
+  }
+  if (url.protocol === 'http:' || url.protocol === 'https:' || url.protocol === 'ws:' || url.protocol === 'wss:') return url.origin;
+  return url.protocol;
+}
+
+/** Whether a module specifier is a path in JavaScript's sense: it starts with /, ./ or ../. */
+export function isPathSpecifier(specifier: string): boolean {
+  return specifier.startsWith('/') || specifier.startsWith('./') || specifier.startsWith('../');
+}
+
+/** A path segment percent-decoded, or as written when it does not decode. */
+function decodeSegment(seg: string): string {
+  try {
+    return decodeURIComponent(seg);
+  } catch {
+    return seg;
+  }
+}
+
+/**
+ * The path under app/ that the local reference `ref` names, resolved against the referring file's path (`from`, POSIX
+ * and relative to app/, like `src/main.js`; a page is its own path): a leading / starts at app/ (the app served at its
+ * server's root), else the referring file's directory. Its query and fragment are dropped, each segment
+ * percent-decoded. '' is app/ itself. Null when `ref` is not local, names nothing (empty, or only a query or
+ * fragment), or climbs out of app/.
+ */
+export function resolveAppPath(ref: string, from: string): string | null {
+  const r = cleanRef(ref);
+  if (!isLocalRef(r)) return null;
+  const cut = r.search(/[?#]/);
+  const raw = cut < 0 ? r : r.slice(0, cut);
+  if (raw === '') return null;
+  const parts = raw.startsWith('/') ? [] : from.split('/').slice(0, -1);
+  for (const piece of raw.split('/')) {
+    const seg = decodeSegment(piece);
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') {
+      if (parts.length === 0) return null;
+      parts.pop();
+      continue;
+    }
+    parts.push(seg);
+  }
+  return parts.join('/');
+}
+
+/**
+ * The path a page's relative references resolve from: a file path whose directory is the page's base. Its first
+ * <base href>, when that is local and stays inside app/ (a base naming a directory, like `/` or `sub/`, is that
+ * directory), else the page's own path. A base on another origin is the gate's refusal, not this function's.
+ */
+export function pageBaseFrom(facts: HtmlFacts, page: string): string {
+  const href = facts.bases[0];
+  if (href === undefined || !isLocalRef(href)) return page;
+  const r = cleanRef(href);
+  const cut = r.search(/[?#]/);
+  const raw = cut < 0 ? r : r.slice(0, cut);
+  if (raw === '') return page;
+  const dirLike = raw.endsWith('/') || /(?:^|\/)\.\.?$/.test(raw);
+  const target = resolveAppPath(dirLike ? `${raw.endsWith('/') ? raw : `${raw}/`}_` : raw, page);
+  return target === null ? page : target;
+}
+
+/** What an import map says about a specifier: found false when it maps nothing, or value null when a null entry blocks it. */
+export interface ImportMapMatch {
+  found: boolean;
+  value: string | null;
+}
+
+/** The entry for a specifier in one map: an exact own key, else the longest own key ending in / that prefixes it. */
+function entryOf(entries: Record<string, string | null>, specifier: string): ImportMapMatch {
+  if (Object.hasOwn(entries, specifier)) return { found: true, value: entries[specifier]! };
+  let best: string | null = null;
+  for (const key of Object.keys(entries)) {
+    if (key.endsWith('/') && specifier.startsWith(key) && (best === null || key.length > best.length)) best = key;
+  }
+  if (best === null) return { found: false, value: null };
+  const base = entries[best]!;
+  if (base === null) return { found: true, value: null };
+  return { found: true, value: `${base}${specifier.slice(best.length)}` };
+}
+
+/**
+ * The app path a scope key names from the page's base, or null when it names none (another origin's): a key ending in
+ * / is a directory prefix (its path ending in /, or '' for app/ itself), any other key one file's path.
+ */
+function scopePath(scope: string, base: string): string | null {
+  const r = cleanRef(scope);
+  const cut = r.search(/[?#]/);
+  const raw = cut < 0 ? r : r.slice(0, cut);
+  if (!isLocalRef(raw)) return null;
+  const target = resolveAppPath(raw.endsWith('/') ? `${raw}_` : raw, base);
+  if (target === null) return null;
+  return raw.endsWith('/') ? target.slice(0, -1) : target;
+}
+
+/** Whether a module at `from` is in the scope at `prefix` (scopePath's): under a directory prefix, or that very file. */
+const inScope = (prefix: string, from: string): boolean => (prefix === '' || prefix.endsWith('/') ? from.startsWith(prefix) : from === prefix);
+
+/**
+ * What the page's import map says for `specifier` imported from `from` (a path under app/; the page's own path for an
+ * inline script): a matching scope's map first, its longest URL prefix winning, then the top-level imports. `base` is
+ * the page's base (pageBaseFrom), which scope keys resolve from.
+ */
+export function importMapMatch(map: ImportMap | null, specifier: string, from: string = INDEX_HTML, base: string = INDEX_HTML): ImportMapMatch {
+  if (map === null) return { found: false, value: null };
+  let best: { prefix: string; entries: Record<string, string | null> } | null = null;
+  for (const [scope, entries] of Object.entries(map.scopes)) {
+    const prefix = scopePath(scope, base);
+    if (prefix === null || !inScope(prefix, from)) continue;
+    if (best === null || prefix.length > best.prefix.length) best = { prefix, entries };
+  }
+  if (best !== null) {
+    const scoped = entryOf(best.entries, specifier);
+    if (scoped.found) return scoped;
+  }
+  return entryOf(map.imports, specifier);
+}
+
+/**
+ * Whether an import map's value is one a browser takes: a path (/, ./ or ../) or an absolute URL. Any other value
+ * (a bare `vendor/x.js`) is no address, so a browser drops its entry.
+ */
+export function isMapAddress(value: string): boolean {
+  const r = cleanRef(value);
+  return isPathSpecifier(r) || URI_SCHEME.test(r);
+}
+
+/**
+ * The path under app/ a module specifier names, or null when it names none there: a path specifier resolves from the
+ * importing file `from`; an absolute URL names no file of app/; a bare specifier goes through the import map, its
+ * value resolving from the page's base `base` (a value that is no address names nothing).
+ */
+export function resolveModule(specifier: string, from: string, map: ImportMap | null, base: string = INDEX_HTML): string | null {
+  const s = cleanRef(specifier);
+  if (isPathSpecifier(s)) return resolveAppPath(s, from);
+  if (URI_SCHEME.test(s)) return null;
+  const match = importMapMatch(map, specifier, from, base);
+  if (!match.found || match.value === null || !isMapAddress(match.value)) return null;
+  return resolveAppPath(match.value, base);
+}
+
+// ---------------------------------------------------------------- static imports
+
+const IDENT_START = /[A-Za-z_$]/;
