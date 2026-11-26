@@ -898,3 +898,448 @@ export function resolveModule(specifier: string, from: string, map: ImportMap | 
 // ---------------------------------------------------------------- static imports
 
 const IDENT_START = /[A-Za-z_$]/;
+const IDENT = /[A-Za-z0-9_$]/;
+
+/**
+ * A module's static import and export-from specifiers, in source order, by a lexical scan: comments, strings,
+ * template literals and regular-expression literals are skipped, so the words inside them are never read as imports.
+ * This is not a parser; it recognizes `import 'x'`, `import ... from 'x'`, `export ... from 'x'` and
+ * `export * from 'x'`, and leaves anything else alone (`import(...)` and `import.meta` among it).
+ */
+export function sourceImports(source: string): string[] {
+  return scanImports(source).statics;
+}
+
+/**
+ * A script's or module's dynamic import() calls, in source order, by the same lexical scan as sourceImports: each
+ * call's specifier when it is a string literal or a template literal with no substitution (`import('./x.js')`,
+ * ``import(`./x.js`)``, an options argument after it allowed), or null when it is anything else (computed, like
+ * `import(base + 'x.js')` or ``import(`./${name}.js`)``). A method named import (`o.import('x')`) is no call of it.
+ */
+export function dynamicImports(source: string): (string | null)[] {
+  return scanImports(source).dynamics;
+}
+
+/** sourceImports' and dynamicImports' one scan. */
+function scanImports(source: string): { statics: string[]; dynamics: (string | null)[] } {
+  const out: string[] = [];
+  const dynamics: (string | null)[] = [];
+  const n = source.length;
+  let i = 0;
+  /** The last significant (non-space, non-comment) character, for the regex-versus-division guess. */
+  const regexPosition = (prev: string): boolean => prev === '' || '([{,;:=!&|?+-*%^~<>'.includes(prev);
+  let prev = '';
+
+  const skipSpace = (): void => {
+    for (;;) {
+      while (i < n && /\s/.test(source[i]!)) i++;
+      if (source.startsWith('//', i)) {
+        while (i < n && source[i] !== '\n') i++;
+        continue;
+      }
+      if (source.startsWith('/*', i)) {
+        const end = source.indexOf('*/', i + 2);
+        i = end < 0 ? n : end + 2;
+        continue;
+      }
+      return;
+    }
+  };
+  const skipString = (quote: string): string | null => {
+    i++;
+    let s = '';
+    while (i < n) {
+      const ch = source[i]!;
+      if (ch === quote) {
+        i++;
+        return s;
+      }
+      if (ch === '\\') {
+        const next = source[i + 1];
+        if (next === undefined) return null;
+        s += next === 'n' ? '\n' : next === 't' ? '\t' : next === 'r' ? '\r' : next;
+        i += 2;
+        continue;
+      }
+      if (ch === '\n') return null;
+      s += ch;
+      i++;
+    }
+    return null;
+  };
+  const skipTemplate = (): void => {
+    i++;
+    while (i < n) {
+      const ch = source[i]!;
+      if (ch === '\\') {
+        i += 2;
+        continue;
+      }
+      if (ch === '`') {
+        i++;
+        return;
+      }
+      i++;
+    }
+  };
+  const skipRegex = (): void => {
+    i++;
+    let inClass = false;
+    while (i < n) {
+      const ch = source[i]!;
+      if (ch === '\\') {
+        i += 2;
+        continue;
+      }
+      if (ch === '[') inClass = true;
+      else if (ch === ']') inClass = false;
+      else if (ch === '/' && !inClass) {
+        i++;
+        return;
+      } else if (ch === '\n') return;
+      i++;
+    }
+  };
+  const readWord = (): string => {
+    const start = i;
+    while (i < n && IDENT.test(source[i]!)) i++;
+    return source.slice(start, i);
+  };
+  /** Reads a string literal at i, or null; advances past it either way. */
+  const maybeString = (): string | null => {
+    skipSpace();
+    const ch = source[i];
+    if (ch !== '"' && ch !== "'") return null;
+    return skipString(ch);
+  };
+  /** From just after `import`/`export`, reads a clause and its `from 'x'`; returns the specifier or null. */
+  const clause = (stopAt: string[]): string | null => {
+    for (;;) {
+      skipSpace();
+      if (i >= n) return null;
+      const ch = source[i]!;
+      if (stopAt.includes(ch)) return null;
+      if (ch === '"' || ch === "'") return skipString(ch);
+      if (ch === '{' || ch === '}' || ch === ',' || ch === '*') {
+        i++;
+        continue;
+      }
+      if (IDENT_START.test(ch)) {
+        const word = readWord();
+        if (word === 'from') return maybeString();
+        continue;
+      }
+      return null;
+    }
+  };
+
+  /** A template literal at i with no substitution, its escapes read as skipString reads them; null (i unchanged) for one with a `${`. */
+  const plainTemplate = (): string | null => {
+    let j = i + 1;
+    let s = '';
+    while (j < n) {
+      const ch = source[j]!;
+      if (ch === '`') {
+        i = j + 1;
+        return s;
+      }
+      if (ch === '\\') {
+        const next = source[j + 1];
+        if (next === undefined) return null;
+        s += next === 'n' ? '\n' : next === 't' ? '\t' : next === 'r' ? '\r' : next;
+        j += 2;
+        continue;
+      }
+      if (ch === '$' && source[j + 1] === '{') return null;
+      s += ch;
+      j++;
+    }
+    return null;
+  };
+  /**
+   * From the `(` of an import( call: its literal specifier, read and passed, when the argument is a literal alone (an
+   * options argument may follow), else null with i just past the `(` so the scan reads the argument as code.
+   */
+  const dynamicCall = (): void => {
+    const open = i;
+    i++;
+    skipSpace();
+    const ch = source[i];
+    let spec: string | null = null;
+    if (ch === '"' || ch === "'") spec = skipString(ch);
+    else if (ch === '`') spec = plainTemplate();
+    if (spec !== null) {
+      skipSpace();
+      if (source[i] === ')' || source[i] === ',') {
+        dynamics.push(spec);
+        prev = 'a';
+        return;
+      }
+    }
+    dynamics.push(null);
+    i = open + 1;
+    prev = '(';
+  };
+
+  while (i < n) {
+    skipSpace();
+    if (i >= n) break;
+    const ch = source[i]!;
+    if (ch === '"' || ch === "'") {
+      skipString(ch);
+      prev = ch;
+      continue;
+    }
+    if (ch === '`') {
+      skipTemplate();
+      prev = '`';
+      continue;
+    }
+    if (ch === '/') {
+      if (regexPosition(prev)) skipRegex();
+      else i++;
+      prev = '/';
+      continue;
+    }
+    if (IDENT_START.test(ch)) {
+      const member = prev === '.';
+      const word = readWord();
+      prev = 'a';
+      if (word === 'import') {
+        skipSpace();
+        if (source[i] === '(' && !member) {
+          dynamicCall();
+          continue;
+        }
+        if (source[i] === '(' || source[i] === '.') continue;
+        const spec = clause(['=', ';']);
+        if (spec !== null) out.push(spec);
+        continue;
+      }
+      if (word === 'export') {
+        skipSpace();
+        if (source[i] !== '*' && source[i] !== '{') continue;
+        const spec = clause(['=', ';']);
+        if (spec !== null) out.push(spec);
+        continue;
+      }
+      continue;
+    }
+    prev = ch;
+    i++;
+  }
+  return { statics: out, dynamics };
+}
+
+// ---------------------------------------------------------------- stylesheets
+
+/** One reference a stylesheet makes: an @import, a url() inside @font-face (a font), or any other url(). */
+export interface CssReference {
+  kind: 'import' | 'font' | 'url';
+  ref: string;
+}
+
+/** A CSS string or url() body's escapes decoded: a hex escape is its code point, an escaped newline nothing, any other escaped character itself. */
+function cssUnescape(s: string): string {
+  return s.replace(/\\(?:([0-9A-Fa-f]{1,6})[ \t\n\r\f]?|(\r\n|[\n\r\f])|([\s\S]))/g, (_w, hex: string | undefined, nl: string | undefined, ch: string | undefined) => {
+    if (hex !== undefined) {
+      const cp = Number.parseInt(hex, 16);
+      return cp > 0 && cp <= 0x10ffff && (cp < 0xd800 || cp > 0xdfff) ? String.fromCodePoint(cp) : '�';
+    }
+    if (nl !== undefined) return '';
+    return ch ?? '';
+  });
+}
+
+/**
+ * A stylesheet's references in source order, by a lexical scan (comments skipped, strings read whole): each
+ * `@import "x"` or `@import url(x)` (kind import), each url() inside an @font-face block (kind font), and every other
+ * url() (kind url). The `src` of a font may also be a local() name, which names no file and is not returned.
+ */
+export function cssReferences(css: string): CssReference[] {
+  const out: CssReference[] = [];
+  const n = css.length;
+  let i = 0;
+  const blocks: boolean[] = [];
+  let pendingFontFace = false;
+  let pendingImport = false;
+  let fontDepth = 0;
+  const readString = (quote: string): string => {
+    let j = i + 1;
+    let raw = '';
+    while (j < n) {
+      const ch = css[j]!;
+      if (ch === '\\' && j + 1 < n) {
+        raw += css.slice(j, j + 2);
+        j += 2;
+        continue;
+      }
+      if (ch === quote || ch === '\n') {
+        j++;
+        break;
+      }
+      raw += ch;
+      j++;
+    }
+    i = j;
+    return cssUnescape(raw);
+  };
+  while (i < n) {
+    const ch = css[i]!;
+    if (ch === '/' && css[i + 1] === '*') {
+      const end = css.indexOf('*/', i + 2);
+      i = end < 0 ? n : end + 2;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      const value = readString(ch);
+      if (pendingImport) {
+        out.push({ kind: 'import', ref: value });
+        pendingImport = false;
+      }
+      continue;
+    }
+    if (ch === '\\') {
+      i += 2;
+      continue;
+    }
+    if (ch === '@') {
+      let j = i + 1;
+      while (j < n && /[A-Za-z0-9_-]/.test(css[j]!)) j++;
+      const word = css.slice(i + 1, j).toLowerCase();
+      if (word === 'import') pendingImport = true;
+      else if (word === 'font-face') pendingFontFace = true;
+      i = j;
+      continue;
+    }
+    if ((ch === 'u' || ch === 'U') && css.slice(i, i + 4).toLowerCase() === 'url(' && !/[A-Za-z0-9_-]/.test(css[i - 1] ?? '')) {
+      i += 4;
+      while (i < n && /\s/.test(css[i]!)) i++;
+      let value: string;
+      if (css[i] === '"' || css[i] === "'") {
+        value = readString(css[i]!);
+        const close = css.indexOf(')', i);
+        i = close < 0 ? n : close + 1;
+      } else {
+        let j = i;
+        let raw = '';
+        while (j < n && css[j] !== ')') {
+          if (css[j] === '\\' && j + 1 < n) {
+            raw += css.slice(j, j + 2);
+            j += 2;
+            continue;
+          }
+          raw += css[j];
+          j++;
+        }
+        value = cssUnescape(raw.trim());
+        i = j < n ? j + 1 : n;
+      }
+      out.push({ kind: pendingImport ? 'import' : fontDepth > 0 ? 'font' : 'url', ref: value });
+      pendingImport = false;
+      continue;
+    }
+    if (ch === '{') {
+      blocks.push(pendingFontFace);
+      if (pendingFontFace) fontDepth++;
+      pendingFontFace = false;
+      pendingImport = false;
+      i++;
+      continue;
+    }
+    if (ch === '}') {
+      if (blocks.pop() === true) fontDepth--;
+      i++;
+      continue;
+    }
+    if (ch === ';') {
+      pendingImport = false;
+      pendingFontFace = false;
+    }
+    i++;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- order and first load
+
+/** A source file of an app: its path under app/ and its bytes. */
+export interface AppSource {
+  path: string;
+  bytes: Uint8Array;
+}
+
+/**
+ * The source JS files of an app in the order a depth-first walk of static imports reaches them from index.html: each
+ * <script> of a JavaScript type in document order, its src resolved from the page's base or, for an inline module
+ * script, its imports, then each reached file's own static imports in source order, the first time a path is reached.
+ * Specifiers resolve as resolveModule says; one that resolves to no source JS file is skipped, and a file reached once
+ * is never walked twice. `sources` is every source file of app/ (index.html included, which is never in the result).
+ */
+export function importOrder(sources: readonly AppSource[], facts: HtmlFacts): string[] {
+  const byPath = new Map(sources.map((s) => [s.path, s]));
+  const map = importMapOf(facts).map;
+  const base = pageBaseFrom(facts, INDEX_HTML);
+  const order: string[] = [];
+  const seen = new Set<string>();
+  const visit = (path: string | null): void => {
+    if (path === null || seen.has(path) || !MODULE_NAME.test(path) || !byPath.has(path)) return;
+    seen.add(path);
+    order.push(path);
+    for (const specifier of sourceImports(text(byPath.get(path)!.bytes))) visit(resolveModule(specifier, path, map, base));
+  };
+  for (const script of facts.scripts) {
+    if (!isJavaScriptType(script.type)) continue;
+    if (script.src !== null) visit(resolveAppPath(script.src, base));
+    else if (script.type === 'module') for (const specifier of sourceImports(script.text)) visit(resolveModule(specifier, INDEX_HTML, map, base));
+  }
+  return order;
+}
+
+/** Whether a <link>'s rel makes it a stylesheet the page applies on load (a stylesheet that is not an alternate). */
+const isLoadedStylesheet = (rel: string): boolean => {
+  const tokens = relTokens(rel);
+  return tokens.includes('stylesheet') && !tokens.includes('alternate');
+};
+
+/**
+ * The source CSS files of an app in the order index.html's stylesheets reach them: each <link rel=stylesheet> in
+ * document order and then each inline <style>, each stylesheet's @imports walked depth first, the first time a path is
+ * reached. `sources` is every source file of app/.
+ */
+export function cssOrder(sources: readonly AppSource[], facts: HtmlFacts): string[] {
+  const byPath = new Map(sources.map((s) => [s.path, s]));
+  const base = pageBaseFrom(facts, INDEX_HTML);
+  const order: string[] = [];
+  const seen = new Set<string>();
+  const visit = (path: string | null): void => {
+    if (path === null || seen.has(path) || !CSS_NAME.test(path) || !byPath.has(path)) return;
+    seen.add(path);
+    order.push(path);
+    for (const r of cssReferences(text(byPath.get(path)!.bytes))) if (r.kind === 'import') visit(resolveAppPath(r.ref, path));
+  };
+  for (const link of facts.links) if (isLoadedStylesheet(link.rel)) visit(resolveAppPath(link.href, base));
+  for (const style of facts.styles) for (const r of cssReferences(style)) if (r.kind === 'import') visit(resolveAppPath(r.ref, base));
+  return order;
+}
+
+/** A first-load reference that names no file of app/: another origin's URL, or a path app/ does not hold. */
+export interface LoadMiss {
+  ref: string;
+  /** Where the reference is, like `index.html's <script src>` or `imported by app/src/main.js`. */
+  where: string;
+}
+
+/**
+ * The files a first load fetches, in the order the walk reaches them (the header's Load block says the
+ * order), each once, with every first-load reference that names no file of app/; then the files the dynamic import()
+ * calls of the page's scripts and of every module reached fetch later (each literal specifier walked depth first: the
+ * module, its static imports, then its own import() calls), none counted twice. `textOf` reads a file's text by path
+ * (it is called only for .js, .mjs and .css files the walk reaches).
+ */
+export function firstLoadOf(tree: AppTree, facts: HtmlFacts, textOf: (path: string) => string): FirstLoadPaths {
+  const files = new Set(tree.files.map((f) => f.path));
+  const map = importMapOf(facts).map;
+  const base = pageBaseFrom(facts, INDEX_HTML);
+  const paths: string[] = [];
+  const missing: LoadMiss[] = [];
